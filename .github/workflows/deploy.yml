@@ -7,6 +7,10 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
+concurrency:
+  group: deploy-production
+  cancel-in-progress: true
+
 env:
   PROJECT_ID: lab-create-os
   REGION: us-central1
