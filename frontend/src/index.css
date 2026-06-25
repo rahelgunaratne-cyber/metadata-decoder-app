@@ -1,0 +1,41 @@
+@import "tailwindcss";
+
+/* Decoder palette — mirrors the desktop dashboard so the experience is
+   consistent end to end. */
+@theme {
+  --color-navy: #1f4e78;
+  --color-navy-700: #1a4267;
+  --color-ink: #2c3e50;
+  --color-muted: #6c757d;
+  --color-canvas: #fafbfc;
+
+  --color-artist: #fce4d6;
+  --color-artist-ink: #842029;
+  --color-isrc: #fff2cc;
+  --color-isrc-ink: #664d03;
+  --color-missing: #ddebf7;
+  --color-missing-ink: #084298;
+  --color-format: #c6efce;
+  --color-format-ink: #0f5132;
+  --color-clean: #d1e7dd;
+  --color-clean-ink: #0f5132;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+/* Thin, tidy scrollbars inside scrollable tables. */
+.scroll-area {
+  scrollbar-width: thin;
+}

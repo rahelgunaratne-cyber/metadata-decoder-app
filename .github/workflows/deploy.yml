@@ -1,0 +1,65 @@
+name: Deploy to Cloud Run
+
+# Auto-deploy on every push to main. You can also trigger it by hand from the
+# Actions tab ("Run workflow").
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  PROJECT_ID: lab-create-os
+  REGION: us-central1
+  SERVICE: metadata-decoder
+  REPOSITORY: decoder # Artifact Registry repo (created by scripts/setup-github-deploy.sh)
+  RUNTIME_SA: metadata-decoder-run@lab-create-os.iam.gserviceaccount.com
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # required for Workload Identity Federation
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (keyless)
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - name: Build and push image
+        run: |
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/${SERVICE}:${GITHUB_SHA}"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      # Deploy the new image. Env vars (OAUTH_CLIENT_ID, ALLOWED_EMAILS, etc.) and
+      # all other config are INHERITED from the existing revision — we don't pass
+      # --set-env-vars, so live changes you make with `gcloud run services update`
+      # are preserved across deploys.
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy "$SERVICE" \
+            --image "$IMAGE" \
+            --region "$REGION" \
+            --project "$PROJECT_ID" \
+            --service-account "$RUNTIME_SA" \
+            --quiet
+
+      - name: Show service URL
+        run: |
+          gcloud run services describe "$SERVICE" \
+            --region "$REGION" --project "$PROJECT_ID" \
+            --format='value(status.url)'

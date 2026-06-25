@@ -1,0 +1,24 @@
+# --- Secrets: never commit these (defensive; the webapp doesn't use them) ---
+credentials.json
+.sheets_token.json
+*.client_secret*.json
+.env
+.env.*
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.local_data/
+*.egg-info/
+
+# --- Node / frontend ---
+node_modules/
+frontend/dist/
+backend/static/
+.vite/
+
+# --- OS ---
+.DS_Store

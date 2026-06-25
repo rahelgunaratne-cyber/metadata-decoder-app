@@ -1,0 +1,15 @@
+# Web framework
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+pydantic>=2.7
+
+# Decoder engine dependencies (same as the original desktop tool)
+pandas>=2.0
+openpyxl>=3.1
+rapidfuzz>=3.0
+
+# GCP (used only in production; safe to install everywhere)
+google-cloud-storage>=2.16
+google-cloud-firestore>=2.16
+google-auth>=2.30

@@ -1,0 +1,32 @@
+# Keep the build context small and reproducible.
+
+# Secrets — never ship these (the webapp doesn't use them anyway).
+credentials.json
+.sheets_token.json
+*.client_secret*.json
+.env
+.env.*
+
+# Python
+**/__pycache__/
+**/*.py[cod]
+**/.venv/
+**/venv/
+.local_data/
+**/*.egg-info/
+_smoketest.py
+
+# Node / frontend build artifacts (rebuilt inside the image)
+frontend/node_modules/
+frontend/dist/
+backend/static/
+**/.vite/
+
+# Tooling / OS
+.git/
+.gitignore
+.github/
+scripts/
+.DS_Store
+README.md
+deploy.sh
