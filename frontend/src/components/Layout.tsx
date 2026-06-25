@@ -70,13 +70,13 @@ export function Layout({ children }: { children: ReactNode }) {
           <Brand />
           {user && (
             <div className="flex items-center gap-3">
-              {user.picture ? (
-                <img src={user.picture} alt="" className="h-8 w-8 rounded-full" />
-              ) : null}
               <div className="hidden text-right sm:block">
                 <div className="text-sm font-medium text-ink">{user.name}</div>
                 <div className="text-xs text-muted">{user.email}</div>
               </div>
+              {user.picture ? (
+                <img src={user.picture} alt="" className="h-8 w-8 rounded-full" />
+              ) : null}
               {config?.authEnabled && (
                 <Button variant="ghost" onClick={signOut}>
                   Sign out
