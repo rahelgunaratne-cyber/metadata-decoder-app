@@ -11,7 +11,7 @@ function Brand() {
       </span>
       <div className="leading-tight">
         <div className="text-[15px] font-bold text-navy">Metadata Decoder</div>
-        <div className="text-[11px] text-muted">Catch mistakes before ingestion</div>
+        <div className="text-[11px] text-muted">Quickly catch mistakes before ingestion</div>
       </div>
     </Link>
   );
