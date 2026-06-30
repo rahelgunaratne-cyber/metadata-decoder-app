@@ -355,13 +355,18 @@ def find_splits_correction_issues(
     # to 100. Only Net rows ("N") must sum to 100.
     net_gross_col = "_splits_net_gross" if "_splits_net_gross" in df.columns else None
 
+    release_id_col = "Release ID" if "Release ID" in df.columns else None
+
     if isrc_col and pct_col:
-        group_col = isrc_col
+        # Group by Release ID + ISRC so the same track appearing on multiple
+        # albums is checked independently per release (not summed together).
         grouped: dict[str, list[tuple[int, float]]] = defaultdict(list)
         for idx, row in df.iterrows():
-            key_val = str(row.get(group_col, "") or "").strip()
-            if not key_val:
+            isrc_val = str(row.get(isrc_col, "") or "").strip()
+            if not isrc_val:
                 continue
+            release_val = str(row.get(release_id_col, "") or "").strip() if release_id_col else ""
+            key_val = f"{release_val}|{isrc_val}" if release_val else isrc_val
             # Skip Gross rows — only Net rows must sum to 100.
             if net_gross_col:
                 ng = str(row.get(net_gross_col, "") or "").strip().upper()
@@ -373,18 +378,23 @@ def find_splits_correction_issues(
                 pct = 0.0
             grouped[key_val].append((int(idx) + 2, pct))
 
-        for isrc_val, row_pairs in sorted(grouped.items()):
+        for group_key, row_pairs in sorted(grouped.items()):
             total = sum(p for _, p in row_pairs)
             diff = abs(total - SPLIT_SUM_TARGET)
             if diff <= SPLIT_SUM_TOLERANCE:
                 continue
+            # group_key is "releaseID|ISRC" or just "ISRC" when no release col.
+            if "|" in group_key:
+                display_release, display_isrc = group_key.split("|", 1)
+            else:
+                display_release, display_isrc = "", group_key
             rows_str = ", ".join(str(r) for r, _ in row_pairs)
+            # Look up track title from the first matching row.
             title_val = ""
             if title_col:
-                for idx, row in df.iterrows():
-                    if str(row.get(group_col, "") or "").strip() == isrc_val:
-                        title_val = str(row.get(title_col, "") or "").strip()
-                        break
+                first_row_idx = row_pairs[0][0] - 2  # convert back to df index
+                if first_row_idx in df.index:
+                    title_val = str(df.at[first_row_idx, title_col] or "").strip()
             for excel_row, pct in row_pairs:
                 issues.append({
                     "Type": TYPE_SPLITS,
@@ -394,11 +404,16 @@ def find_splits_correction_issues(
                     "Found Value": str(pct),
                     "Suggested Value": "Splits must sum to 100",
                     "Similarity": "",
-                    "Cluster": f"S-{isrc_val}",
-                    "Notes": f"ISRC {isrc_val}: splits total {total:.2f}% (expected 100). Rows: {rows_str}.",
+                    "Cluster": f"S-{group_key}",
+                    "Notes": (
+                        f"ISRC {display_isrc}"
+                        + (f" / Release {display_release}" if display_release else "")
+                        + f": net splits total {total:.2f}% (expected 100). Rows: {rows_str}."
+                    ),
                 })
             split_errors.append({
-                "ISRC": isrc_val,
+                "Release ID": display_release,
+                "ISRC": display_isrc,
                 "Track Title": title_val,
                 "Rows": rows_str,
                 "Split Total": round(total, 4),
@@ -2193,7 +2208,7 @@ def write_report(
     # Split Errors tab (EpicWin splits format only) --------------------------
     if split_errors:
         ws_spl = wb.create_sheet("Split Errors")
-        spl_headers = ["ISRC", "Track Title", "Rows", "Split Total", "Difference from 100"]
+        spl_headers = ["Release ID", "ISRC", "Track Title", "Rows", "Split Total", "Difference from 100"]
         ws_spl.append(spl_headers)
         for cell in ws_spl[1]:
             cell.fill = HEADER_FILL

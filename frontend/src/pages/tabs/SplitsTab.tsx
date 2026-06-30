@@ -20,6 +20,7 @@ export function SplitsTab({ results }: { results: Results }) {
           <DataTable
             head={
               <>
+                <Th>Release ID</Th>
                 <Th>ISRC</Th>
                 <Th>Track Title</Th>
                 <Th>Rows</Th>
@@ -32,6 +33,7 @@ export function SplitsTab({ results }: { results: Results }) {
               const diff = Number(r["Difference from 100"] ?? 0);
               return (
                 <tr key={i} className="hover:bg-slate-50">
+                  <Td className="font-mono text-xs text-muted">{String(r["Release ID"] ?? "")}</Td>
                   <Td className="font-mono text-xs">{String(r["ISRC"] ?? "")}</Td>
                   <Td className="max-w-[16rem] truncate text-xs">{String(r["Track Title"] ?? "")}</Td>
                   <Td className="text-xs text-muted">{String(r["Rows"] ?? "")}</Td>
