@@ -215,7 +215,7 @@ FORMAT_SCHEMAS: dict[str, dict] = {
         "checks": {"artist_typos", "isrc_duplicates", "missing_fields", "format_validation"},
     },
     "epicwin-splits": {
-        "display_name": "EpicWin Splits Correction",
+        "display_name": "Splits Correction",
         "sheet_hints": ["Sheet1", "Splits"],
         "column_aliases": {
             # The "NEW " prefix is stripped before aliasing (see normalize_columns).
@@ -350,7 +350,11 @@ def find_splits_correction_issues(
     account_id_col = "_splits_account_id" if "_splits_account_id" in df.columns else None
     account_name_col = "_splits_account_name" if "_splits_account_name" in df.columns else None
 
-    # ---- 1. Splits sum to 100 -----------------------------------------------
+    # ---- 1. Splits sum to 100 (Net rows only) --------------------------------
+    # Gross allocations (Net/Gross = "G") are variable and do not need to sum
+    # to 100. Only Net rows ("N") must sum to 100.
+    net_gross_col = "_splits_net_gross" if "_splits_net_gross" in df.columns else None
+
     if isrc_col and pct_col:
         group_col = isrc_col
         grouped: dict[str, list[tuple[int, float]]] = defaultdict(list)
@@ -358,6 +362,11 @@ def find_splits_correction_issues(
             key_val = str(row.get(group_col, "") or "").strip()
             if not key_val:
                 continue
+            # Skip Gross rows — only Net rows must sum to 100.
+            if net_gross_col:
+                ng = str(row.get(net_gross_col, "") or "").strip().upper()
+                if ng == "G":
+                    continue
             try:
                 pct = float(row.get(pct_col, 0) or 0)
             except (ValueError, TypeError):
@@ -406,7 +415,9 @@ def find_splits_correction_issues(
         for idx, row in df.iterrows():
             id_val = str(row.get(id_col, "") or "").strip()
             name_val = str(row.get(name_col, "") or "").strip()
-            if not id_val or not name_val:
+            # Skip blank/NaN IDs — a missing ID means no account exists yet,
+            # not a mismatch. "nan" is pandas' NaN rendered as a string.
+            if not id_val or id_val.lower() == "nan" or not name_val or name_val.lower() == "nan":
                 continue
             id_to_names[id_val].add(name_val)
             name_to_ids[name_val].add(id_val)
@@ -996,25 +1007,24 @@ def find_isrc_conflicts(
     tracks_sheet: str,
     isrc_leave_records: list[frozenset] | None = None,
     prior_isrc_actions: dict[tuple[str, int], dict] | None = None,
+    check_same_release: bool = True,
 ) -> tuple[list[dict], list[dict]]:
     """
-    Find ISRCs that appear on multiple rows with different Track Display Artist
-    values (after normalization). Returns:
-        issues          — one dict per conflicting cell (for the Issues tab + annotated copy)
-        conflict_summary — one dict PER OFFENDING ROW (for the ISRC Conflicts tab,
-                           which is the user's per-row review surface for
-                           Confirm OK? + Corrected ISRC).
+    Flag two kinds of ISRC problems (applies to all formats):
 
-    Same ISRC + same artist + same title across multiple releases is NOT flagged
-    (that's a recording legitimately appearing on multiple releases).
+      1. Same ISRC → different Track Title (after normalization).
+         An ISRC uniquely identifies a recording; if two rows share the same
+         ISRC but have different titles one of them is wrong.
 
-    Conflicts whose (ISRC, normalized-artist-set) signature appears in
-    `isrc_leave_records` are skipped — the user previously confirmed them as
-    intentional via the "Confirm OK?" column.
+      2. Same ISRC appearing more than once within the same release (same UPC).
+         The same recording on multiple albums is fine; appearing twice on the
+         same album is a duplicate row.
 
-    `prior_isrc_actions` is an optional carry-forward map from a previous
-    scan's ISRC Conflicts tab so the user's in-progress entries (Confirm OK?,
-    Corrected ISRC) survive a re-scan. Keys are (ISRC, Excel Row).
+    The previous check (same ISRC + different artist) produced too many false
+    positives because the same track legitimately appears under different
+    credited artists across releases.
+
+    Returns (issues, conflict_summary).
     """
     isrc_leave_records = isrc_leave_records or []
     prior_isrc_actions = prior_isrc_actions or {}
@@ -1022,8 +1032,11 @@ def find_isrc_conflicts(
     if ISRC_COLUMN not in df.columns:
         return [], []
 
-    has_artist = DISPLAY_ARTIST_COLUMN in df.columns
     has_title = TRACK_TITLE_COLUMN in df.columns
+    has_artist = DISPLAY_ARTIST_COLUMN in df.columns
+    has_upc = "UPC" in df.columns
+    # Splits format uses "Release ID" instead of UPC as the release grouper.
+    release_col = "UPC" if has_upc else ("Release ID" if "Release ID" in df.columns else None)
 
     grouped: dict[str, list[dict]] = defaultdict(list)
     for idx, row in df.iterrows():
@@ -1031,51 +1044,63 @@ def find_isrc_conflicts(
         if not isinstance(isrc_raw, str) or not isrc_raw.strip():
             continue
         isrc = isrc_raw.strip()
-        artist = str(row.get(DISPLAY_ARTIST_COLUMN, "") or "") if has_artist else ""
-        title = str(row.get(TRACK_TITLE_COLUMN, "") or "") if has_title else ""
+        title = str(row.get(TRACK_TITLE_COLUMN, "") or "").strip() if has_title else ""
+        artist = str(row.get(DISPLAY_ARTIST_COLUMN, "") or "").strip() if has_artist else ""
+        release = str(row.get(release_col, "") or "").strip() if release_col else ""
         grouped[isrc].append({
-            "row": int(idx) + 2,  # +2 = 1 header row + 1-based Excel
+            "row": int(idx) + 2,
             "isrc": isrc,
-            "artist": artist.strip(),
-            "title": title.strip(),
+            "title": title,
+            "artist": artist,
+            "release": release,
         })
 
     issues: list[dict] = []
     per_row_summary: list[dict] = []
     conflict_id = 1
 
-    # Sort conflicts by ISRC for stable Conflict-ID assignment across runs.
     for isrc in sorted(grouped.keys()):
         occs = grouped[isrc]
         if len(occs) < 2:
             continue
-        unique_artists_norm = {normalize(o["artist"]) for o in occs if o["artist"]}
-        if len(unique_artists_norm) <= 1:
-            # Same recording on multiple releases — not an error.
-            continue
-        if _isrc_conflict_is_left(occs, isrc_leave_records):
-            # User confirmed this exact ISRC + artist constellation as
-            # intentional on a previous run. Don't re-flag.
+
+        # ---- Check 1: same ISRC → different Track Title ----------------------
+        unique_titles_norm = {normalize(o["title"]) for o in occs if o["title"]}
+        title_conflict = len(unique_titles_norm) > 1
+
+        # ---- Check 2: same ISRC + same release appearing more than once ------
+        # Skipped for splits-correction sheets where multiple rows per ISRC/
+        # release is the expected data structure (one row per allocatee).
+        release_conflict = False
+        if check_same_release and release_col:
+            release_counts: dict[str, int] = defaultdict(int)
+            for o in occs:
+                if o["release"]:
+                    release_counts[o["release"]] += 1
+            release_conflict = any(n > 1 for n in release_counts.values())
+
+        if not title_conflict and not release_conflict:
             continue
 
-        # Human-readable list of distinct artist spellings, first-seen order.
-        seen_artists: list[str] = []
+        if _isrc_conflict_is_left(occs, isrc_leave_records):
+            continue
+
+        seen_titles: list[str] = []
         for o in occs:
-            a = o["artist"]
-            if a and a not in seen_artists:
-                seen_artists.append(a)
-        artists_str = "; ".join(seen_artists) if seen_artists else "(blank)"
+            if o["title"] and o["title"] not in seen_titles:
+                seen_titles.append(o["title"])
 
         rows_str = ", ".join(str(o["row"]) for o in occs)
         cluster_label = f"I{conflict_id}"
 
         for o in occs:
-            note_parts = [
-                f"Same ISRC on rows {rows_str}.",
-                f"Distinct artists: {artists_str}.",
-            ]
-            if o["title"]:
-                note_parts.append(f"Title: {o['title']}.")
+            reasons = []
+            if title_conflict:
+                reasons.append(f"ISRC maps to multiple track titles: {'; '.join(seen_titles)}.")
+            if release_conflict and o["release"] and release_counts.get(o["release"], 0) > 1:
+                reasons.append(f"ISRC appears more than once in release {o['release']}.")
+            if not reasons:
+                continue
             issues.append({
                 "Type": TYPE_ISRC,
                 "Sheet": tracks_sheet,
@@ -1085,7 +1110,7 @@ def find_isrc_conflicts(
                 "Suggested Value": "",
                 "Similarity": "",
                 "Cluster": cluster_label,
-                "Notes": " ".join(note_parts),
+                "Notes": f"Rows {rows_str}. " + " ".join(reasons),
             })
 
             prior = prior_isrc_actions.get((isrc, o["row"]), {})
@@ -2343,6 +2368,7 @@ def analyze(
                 df, sheet_name,
                 isrc_leave_records=isrc_leave_records,
                 prior_isrc_actions=prior_isrc_actions,
+                check_same_release=(schema_key != "epicwin-splits"),
             )
             all_isrc_issues.extend(isrc_iss)
             all_isrc_summary.extend(isrc_sum)
@@ -2371,7 +2397,8 @@ def analyze(
 
         if "splits_correction" in checks:
             spl_iss, spl_err, id_mis = find_splits_correction_issues(df, sheet_name)
-            all_format_issues.extend(spl_iss)   # surface in Issues tab
+            # Keep splits/ID issues separate from format_issues so the Formats
+            # tab count only reflects genuine format validation errors.
             all_split_errors.extend(spl_err)
             all_id_mismatches.extend(id_mis)
 
@@ -2433,6 +2460,9 @@ def analyze(
     artist_issues.sort(key=lambda r: (r["Cluster"], r["Excel Row"]))
 
     # ---- Combine -----------------------------------------------------------
+    # splits/ID issues are tracked separately and not mixed into format_issues
+    # so the Formats tab count stays accurate. They appear in the downloaded
+    # report's dedicated tabs and the UI's Splits tab.
     issues = artist_issues + all_isrc_issues + all_missing_issues + all_format_issues
 
     # Build format display string (deduplicated, preserving order).
@@ -2460,7 +2490,8 @@ def analyze(
         "format_columns_wide": len(all_format_column_summary),
         "splits_errors": len(all_split_errors),
         "id_mismatches": len(all_id_mismatches),
-        "total_issues": len(issues),
+        "splits_issues": len(all_split_errors) + len(all_id_mismatches),
+        "total_issues": len(issues) + len(all_split_errors) + len(all_id_mismatches),
     }
     return (
         issues,

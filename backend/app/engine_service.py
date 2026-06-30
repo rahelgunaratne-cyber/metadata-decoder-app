@@ -141,6 +141,7 @@ class EngineService:
             "formatIssues": stats.get("format_issues", 0),
             "splitErrors": stats.get("splits_errors", 0),
             "idMismatches": stats.get("id_mismatches", 0),
+            "splitsIssues": stats.get("splits_issues", 0),
             "total": stats.get("total_issues", 0),
         }
 

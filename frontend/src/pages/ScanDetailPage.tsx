@@ -9,14 +9,16 @@ import { ArtistTab } from "./tabs/ArtistTab";
 import { IsrcTab } from "./tabs/IsrcTab";
 import { MissingTab } from "./tabs/MissingTab";
 import { FormatTab } from "./tabs/FormatTab";
+import { SplitsTab } from "./tabs/SplitsTab";
 
-type TabKey = "artist" | "isrc" | "missing" | "format";
+type TabKey = "artist" | "isrc" | "missing" | "format" | "splits";
 
 const TAB_META: { key: TabKey; label: string; count: (c: Counts) => number }[] = [
   { key: "artist", label: "Artist names", count: (c) => c.artistTypos },
   { key: "isrc", label: "Duplicate ISRCs", count: (c) => c.isrcConflicts },
   { key: "missing", label: "Missing fields", count: (c) => c.missingFields },
   { key: "format", label: "Formats", count: (c) => c.formatIssues },
+  { key: "splits", label: "Splits", count: (c) => c.splitsIssues ?? 0 },
 ];
 
 export function ScanDetailPage() {
@@ -118,7 +120,11 @@ export function ScanDetailPage() {
       ) : (
         <>
           <div className="flex flex-wrap gap-1 border-b border-slate-200">
-            {TAB_META.map((t) => {
+            {TAB_META.filter((t) => {
+              // Only show the Splits tab for splits-format files
+              if (t.key === "splits") return (scan.counts.splitsIssues ?? 0) > 0;
+              return true;
+            }).map((t) => {
               const n = t.count(scan.counts);
               const active = tab === t.key;
               return (
@@ -151,6 +157,7 @@ export function ScanDetailPage() {
             {tab === "isrc" && <IsrcTab {...tabProps} />}
             {tab === "missing" && <MissingTab {...tabProps} />}
             {tab === "format" && <FormatTab {...tabProps} />}
+            {tab === "splits" && <SplitsTab results={results} />}
           </div>
         </>
       )}

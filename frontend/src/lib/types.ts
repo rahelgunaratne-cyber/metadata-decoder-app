@@ -8,6 +8,7 @@ export interface Counts {
   formatIssues: number;
   splitErrors: number;
   idMismatches: number;
+  splitsIssues: number;
   total: number;
 }
 
