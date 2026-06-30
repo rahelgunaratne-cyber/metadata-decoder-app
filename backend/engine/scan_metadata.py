@@ -1,6 +1,12 @@
 """
-Metadata Sheet Scanner — v2
+Metadata Sheet Scanner — v3
 ============================
+Scans a Label Engine metadata sheet for issues across three supported formats:
+  • label-engine   — Label Engine Master Metadata template (full ingestion sheet)
+  • internal-deals — Internal Deals template (master + composition tabs; trimmed fields)
+  • epicwin-splits — EpicWin splits-correction import (ISRC/splits/ID checks only)
+
+Legacy description:
 Scans a Bossa-format metadata sheet for two kinds of issues:
     1. Misspelled / inconsistent artist names (fuzzy matching).
     2. Duplicate ISRCs that appear on rows with different artists.
@@ -144,35 +150,356 @@ PLACEHOLDER_VALUES = {
 }
 
 
+# ---- Format schemas ---------------------------------------------------------
+#
+# Each schema declares:
+#   display_name   — shown in the UI and report headers
+#   sheet_hints    — ordered list of sheet-name substrings to look for (first match wins)
+#   column_aliases — maps the sheet's column names → canonical engine column names
+#                    Applied as a rename step before any checks run, so all existing
+#                    logic stays untouched.
+#   required_fields_override — if not None, replaces REQUIRED_FIELDS for this format
+#   checks         — set of check names to run; omit a name to skip that check
+#                    Recognised names: "artist_typos", "isrc_duplicates",
+#                    "missing_fields", "format_validation",
+#                    "splits_correction"  (EpicWin-specific)
+#
+# The "label-engine" schema is the identity mapping — no aliases, all checks,
+# REQUIRED_FIELDS unchanged — kept explicit so detect_format() has a concrete
+# object to return.
+
+FORMAT_SCHEMAS: dict[str, dict] = {
+    "label-engine": {
+        "display_name": "Label Engine Master",
+        "sheet_hints": ["Metadata - Master"],
+        "column_aliases": {},
+        "required_fields_override": None,   # use global REQUIRED_FIELDS
+        "checks": {"artist_typos", "isrc_duplicates", "missing_fields", "format_validation"},
+    },
+    "internal-deals-master": {
+        "display_name": "Internal Deals — Master",
+        "sheet_hints": ["Metadata - Master (Internal", "Metadata - Master"],
+        "column_aliases": {
+            # The internal deals sheet uses "ISRC" and "Label" instead of the
+            # canonical engine names.
+            "ISRC": "Track ISRC",
+            "Label": "Label Name",
+        },
+        # This is a summary / deal sheet — audio/artwork paths and full artist
+        # slots are intentionally absent. Only check what's actually present.
+        "required_fields_override": [
+            "UPC",
+            "Release Title",
+            "Track ISRC",
+            "Track Title",
+            "Track Display Artist",
+            "Release Date",
+        ],
+        "checks": {"artist_typos", "isrc_duplicates", "missing_fields", "format_validation"},
+    },
+    "internal-deals-composition": {
+        "display_name": "Internal Deals — Composition",
+        "sheet_hints": ["Metadata - Composition (Interna", "Metadata - Composition"],
+        "column_aliases": {
+            "ISRC": "Track ISRC",
+            "Label": "Label Name",
+        },
+        "required_fields_override": [
+            "UPC",
+            "Release Title",
+            "Track ISRC",
+            "Track Title",
+            "Track Display Artist",
+            "Release Date",
+        ],
+        "checks": {"artist_typos", "isrc_duplicates", "missing_fields", "format_validation"},
+    },
+    "epicwin-splits": {
+        "display_name": "EpicWin Splits Correction",
+        "sheet_hints": ["Sheet1", "Splits"],
+        "column_aliases": {
+            # The "NEW " prefix is stripped before aliasing (see normalize_columns).
+            # These are the canonical post-strip → engine-canonical mappings.
+            "ISRC": "Track ISRC",
+            "Track Artist": "Track Display Artist",
+            "Client or Label ID": "_splits_client_id",
+            "Client Name": "_splits_client_name",
+            "Account ID": "_splits_account_id",
+            "Account Name": "_splits_account_name",
+            "Allocation Percentage": "_splits_allocation_pct",
+            "Allocation Type": "_splits_allocation_type",
+            "Net / Gross": "_splits_net_gross",
+        },
+        "required_fields_override": [],   # no required-fields check for splits sheets
+        "checks": {"artist_typos", "isrc_duplicates", "format_validation", "splits_correction"},
+    },
+}
+
+# Fingerprint columns used to identify each format from the header row.
+# A format matches if ≥ MATCH_THRESHOLD of its fingerprint columns are present.
+FORMAT_FINGERPRINTS: dict[str, list[str]] = {
+    "label-engine": [
+        "Label Name", "Track ISRC", "UPC", "Release Artist", "Release Title",
+        "Artist 1 Client Name", "Artist 1 Name on Track",
+    ],
+    "internal-deals-master": [
+        "ISRC", "UPC", "Release Title", "Track Title", "Track Display Artist",
+        "Current LE Royalty Split - Seller",
+    ],
+    "internal-deals-composition": [
+        "ISRC", "UPC", "Release Title", "Track Title", "ISWC",
+        "Current LE Royalty Split - Seller",
+    ],
+    "epicwin-splits": [
+        "ISRC", "UPC", "Release Artist", "Track Artist", "Track Title",
+    ],
+}
+FORMAT_MATCH_THRESHOLD = 0.6   # fraction of fingerprint columns that must be present
+
+
+def _strip_new_prefix(headers: list[str | None]) -> list[str | None]:
+    """Strip the 'NEW ' prefix from EpicWin-style column headers."""
+    out = []
+    for h in headers:
+        if isinstance(h, str) and h.upper().startswith("NEW "):
+            out.append(h[4:].strip())
+        else:
+            out.append(h)
+    return out
+
+
+def detect_format(wb, sheet_name: str) -> dict:
+    """
+    Detect which FORMAT_SCHEMAS entry best matches the given sheet.
+    Returns the schema dict (never None — falls back to "label-engine").
+    """
+    ws = wb[sheet_name]
+    raw_headers = list(next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ()))
+    headers = set(str(h).strip() for h in _strip_new_prefix(raw_headers) if h is not None)
+
+    best_key = "label-engine"
+    best_score = 0.0
+    for key, fingerprint in FORMAT_FINGERPRINTS.items():
+        if not fingerprint:
+            continue
+        score = sum(1 for col in fingerprint if col in headers) / len(fingerprint)
+        if score > best_score:
+            best_score = score
+            best_key = key
+
+    if best_score < FORMAT_MATCH_THRESHOLD:
+        best_key = "label-engine"
+
+    return {**FORMAT_SCHEMAS[best_key], "_key": best_key}
+
+
+def normalize_columns(df: pd.DataFrame, schema: dict) -> pd.DataFrame:
+    """
+    Rename columns to canonical engine names according to the schema's
+    column_aliases map. Also strips the 'NEW ' prefix from any remaining
+    headers (EpicWin files may have inconsistent prefixing).
+    Returns a new DataFrame with renamed columns; the original is unchanged.
+    """
+    # Step 1: strip "NEW " prefix from all column names.
+    new_cols = {}
+    for col in df.columns:
+        if isinstance(col, str) and col.upper().startswith("NEW "):
+            new_cols[col] = col[4:].strip()
+    if new_cols:
+        df = df.rename(columns=new_cols)
+
+    # Step 2: apply schema aliases.
+    aliases = schema.get("column_aliases", {})
+    if aliases:
+        df = df.rename(columns={k: v for k, v in aliases.items() if k in df.columns})
+
+    return df
+
+
+# ---- EpicWin splits-specific checks -----------------------------------------
+
+TYPE_SPLITS = "Splits error"
+TYPE_ID_MISMATCH = "ID mismatch"
+
+
+def find_splits_correction_issues(
+    df: pd.DataFrame,
+    sheet_name: str,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """
+    EpicWin splits-correction checks:
+      1. Split sum per ISRC must equal 100 (within SPLIT_SUM_TOLERANCE).
+      2. Client or Label ID must map 1-to-1 with Client Name.
+      3. Account ID must map 1-to-1 with Account Name.
+
+    Returns (issues, split_errors, id_mismatches).
+      issues        — unified list for the Issues tab
+      split_errors  — per-ISRC rows for the Split Errors tab
+      id_mismatches — per-conflict rows for the ID Mismatches tab
+    """
+    issues: list[dict] = []
+    split_errors: list[dict] = []
+    id_mismatches: list[dict] = []
+
+    isrc_col = "Track ISRC" if "Track ISRC" in df.columns else None
+    pct_col = "_splits_allocation_pct" if "_splits_allocation_pct" in df.columns else None
+    track_id_col = "Track ID" if "Track ID" in df.columns else None
+    title_col = "Track Title" if "Track Title" in df.columns else None
+    client_id_col = "_splits_client_id" if "_splits_client_id" in df.columns else None
+    client_name_col = "_splits_client_name" if "_splits_client_name" in df.columns else None
+    account_id_col = "_splits_account_id" if "_splits_account_id" in df.columns else None
+    account_name_col = "_splits_account_name" if "_splits_account_name" in df.columns else None
+
+    # ---- 1. Splits sum to 100 -----------------------------------------------
+    if isrc_col and pct_col:
+        group_col = isrc_col
+        grouped: dict[str, list[tuple[int, float]]] = defaultdict(list)
+        for idx, row in df.iterrows():
+            key_val = str(row.get(group_col, "") or "").strip()
+            if not key_val:
+                continue
+            try:
+                pct = float(row.get(pct_col, 0) or 0)
+            except (ValueError, TypeError):
+                pct = 0.0
+            grouped[key_val].append((int(idx) + 2, pct))
+
+        for isrc_val, row_pairs in sorted(grouped.items()):
+            total = sum(p for _, p in row_pairs)
+            diff = abs(total - SPLIT_SUM_TARGET)
+            if diff <= SPLIT_SUM_TOLERANCE:
+                continue
+            rows_str = ", ".join(str(r) for r, _ in row_pairs)
+            title_val = ""
+            if title_col:
+                for idx, row in df.iterrows():
+                    if str(row.get(group_col, "") or "").strip() == isrc_val:
+                        title_val = str(row.get(title_col, "") or "").strip()
+                        break
+            for excel_row, pct in row_pairs:
+                issues.append({
+                    "Type": TYPE_SPLITS,
+                    "Sheet": sheet_name,
+                    "Excel Row": excel_row,
+                    "Column": pct_col.replace("_splits_", "").replace("_", " ").title(),
+                    "Found Value": str(pct),
+                    "Suggested Value": "Splits must sum to 100",
+                    "Similarity": "",
+                    "Cluster": f"S-{isrc_val}",
+                    "Notes": f"ISRC {isrc_val}: splits total {total:.2f}% (expected 100). Rows: {rows_str}.",
+                })
+            split_errors.append({
+                "ISRC": isrc_val,
+                "Track Title": title_val,
+                "Rows": rows_str,
+                "Split Total": round(total, 4),
+                "Difference from 100": round(total - 100, 4),
+            })
+
+    # ---- 2. Client ID ↔ Client Name consistency -----------------------------
+    def _check_id_name_pair(id_col: str | None, name_col: str | None, label: str) -> None:
+        if not id_col or not name_col:
+            return
+        id_to_names: dict[str, set[str]] = defaultdict(set)
+        name_to_ids: dict[str, set[str]] = defaultdict(set)
+        id_to_rows: dict[str, list[int]] = defaultdict(list)
+        for idx, row in df.iterrows():
+            id_val = str(row.get(id_col, "") or "").strip()
+            name_val = str(row.get(name_col, "") or "").strip()
+            if not id_val or not name_val:
+                continue
+            id_to_names[id_val].add(name_val)
+            name_to_ids[name_val].add(id_val)
+            id_to_rows[id_val].append(int(idx) + 2)
+
+        mismatch_id = 1
+        for id_val, names in sorted(id_to_names.items()):
+            if len(names) <= 1:
+                continue
+            rows_str = ", ".join(str(r) for r in id_to_rows[id_val])
+            names_str = "; ".join(sorted(names))
+            for excel_row in id_to_rows[id_val]:
+                issues.append({
+                    "Type": TYPE_ID_MISMATCH,
+                    "Sheet": sheet_name,
+                    "Excel Row": excel_row,
+                    "Column": id_col.replace("_splits_", "").replace("_", " ").title(),
+                    "Found Value": id_val,
+                    "Suggested Value": "Resolve to a single name",
+                    "Similarity": "",
+                    "Cluster": f"ID-{mismatch_id}",
+                    "Notes": f"{label} ID '{id_val}' maps to multiple names: {names_str}. Rows: {rows_str}.",
+                })
+            id_mismatches.append({
+                "Type": f"{label} ID → multiple names",
+                "ID": id_val,
+                "Names found": names_str,
+                "Rows": rows_str,
+            })
+            mismatch_id += 1
+
+        for name_val, ids in sorted(name_to_ids.items()):
+            if len(ids) <= 1:
+                continue
+            ids_str = "; ".join(sorted(ids))
+            id_mismatches.append({
+                "Type": f"{label} name → multiple IDs",
+                "ID": ids_str,
+                "Names found": name_val,
+                "Rows": "—",
+            })
+
+    _check_id_name_pair(client_id_col, client_name_col, "Client")
+    _check_id_name_pair(account_id_col, account_name_col, "Account")
+
+    return issues, split_errors, id_mismatches
+
+
 # ---- Helpers ----------------------------------------------------------------
 
 
 def detect_tracks_sheet(input_path: Path) -> tuple[str, list[tuple[str, int, int]]]:
     """
-    Identify which worksheet holds the track data, even when several tabs have a
-    "Track ISRC" column (summary views, upload-formatted exports, etc.).
+    Identify which worksheet holds the track data.
 
-    Strategy:
-      1. Find every sheet whose header row contains "Track ISRC".
-      2. Score each by how many CORE_TRACK_COLUMNS its header row contains.
-      3. Pick the highest-scoring one. Tie-break by total column count (more = better),
-         then by sheet name (alphabetical) for stability.
-      4. If no sheet has Track ISRC at all, fall back to the first sheet in the workbook.
+    For Label Engine Master files: picks the sheet with "Track ISRC" and the
+    most CORE_TRACK_COLUMNS (existing behaviour).
 
-    Returns a tuple of (chosen_sheet_name, candidates) where candidates is a list of
-    (sheet_name, score, col_count) for every sheet with Track ISRC, sorted from best
-    to worst — useful so the caller can tell the user which sheet was chosen and what
-    other tabs were considered.
+    For Internal Deals files: looks for the "Metadata - Master" tab first.
+    For EpicWin files: looks for a sheet with ISRC + Allocation Percentage
+    columns (after stripping any "NEW " prefix).
+
+    Returns (chosen_sheet_name, candidates) — candidates is the same scored
+    list as before (empty for non-LE-Master formats).
     """
     wb = load_workbook(input_path, read_only=True, data_only=True)
     try:
+        # ---- Try format-schema sheet hints first ----------------------------
+        for schema_key, schema in FORMAT_SCHEMAS.items():
+            if schema_key in ("label-engine",):
+                continue   # handled by the original scoring logic below
+            for hint in schema.get("sheet_hints", []):
+                for sheet_name in wb.sheetnames:
+                    if hint.lower() in sheet_name.lower():
+                        ws = wb[sheet_name]
+                        raw = list(next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ()))
+                        cleaned = set(str(h).strip() for h in _strip_new_prefix(raw) if h)
+                        fp = FORMAT_FINGERPRINTS.get(schema_key, [])
+                        if fp:
+                            score = sum(1 for c in fp if c in cleaned) / len(fp)
+                            if score >= FORMAT_MATCH_THRESHOLD:
+                                return sheet_name, []
+
+        # ---- Original LE-Master scoring logic --------------------------------
         candidates: list[tuple[str, int, int]] = []
         for name in wb.sheetnames:
             ws = wb[name]
             first_row = list(next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ()))
-            if "Track ISRC" not in first_row:
+            # Accept both "Track ISRC" (LE Master) and bare "ISRC" (Internal Deals).
+            header_set = set(str(h).strip() for h in first_row if h)
+            if "Track ISRC" not in header_set and "ISRC" not in header_set:
                 continue
-            score = sum(1 for c in CORE_TRACK_COLUMNS if c in first_row)
+            score = sum(1 for c in CORE_TRACK_COLUMNS if c in header_set)
             n_cols = sum(1 for h in first_row if h is not None)
             candidates.append((name, score, n_cols))
 
@@ -181,6 +508,86 @@ def detect_tracks_sheet(input_path: Path) -> tuple[str, list[tuple[str, int, int
 
         candidates.sort(key=lambda t: (-t[1], -t[2], t[0]))
         return candidates[0][0], candidates
+    finally:
+        wb.close()
+
+
+def detect_all_sheets_to_scan(input_path: Path) -> list[tuple[str, dict]]:
+    """
+    Return a list of (sheet_name, schema) pairs covering every sheet that
+    should be scanned in this workbook.
+
+    For most files this is one entry.  For Internal Deals files both the
+    master-recording and composition metadata tabs are returned so the caller
+    can run checks on each and merge the results.
+
+    Deduplication rules:
+    - For label-engine format: only the single highest-scoring sheet is kept
+      (mirrors the original detect_tracks_sheet behaviour).
+    - For Internal Deals: master + composition are both kept if present.
+    - For EpicWin: the one matching sheet is kept.
+    - composition is preferred over master when the ISWC column is present.
+    """
+    wb = load_workbook(input_path, read_only=True, data_only=True)
+    try:
+        candidates: list[tuple[str, str, float]] = []   # (sheet, schema_key, score)
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            raw = list(next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ()))
+            cleaned_headers = set(str(h).strip() for h in _strip_new_prefix(raw) if h)
+
+            # Check composition before master — ISWC presence disambiguates.
+            # We iterate in a fixed priority order rather than dict order.
+            priority_order = [
+                "internal-deals-composition",
+                "internal-deals-master",
+                "epicwin-splits",
+                "label-engine",
+            ]
+
+            best_key = None
+            best_score = 0.0
+            for key in priority_order:
+                fp = FORMAT_FINGERPRINTS.get(key, [])
+                if not fp:
+                    continue
+                score = sum(1 for c in fp if c in cleaned_headers) / len(fp)
+                # Break ties in favour of composition when ISWC is present.
+                if key == "internal-deals-composition" and "ISWC" not in cleaned_headers:
+                    continue
+                if score >= FORMAT_MATCH_THRESHOLD and score > best_score:
+                    best_score = score
+                    best_key = key
+
+            if best_key:
+                candidates.append((sheet_name, best_key, best_score))
+
+        if not candidates:
+            first = wb.sheetnames[0]
+            return [(first, {**FORMAT_SCHEMAS["label-engine"], "_key": "label-engine"})]
+
+        # For label-engine: keep only the single best sheet.
+        le_candidates = [(s, k, sc) for s, k, sc in candidates if k == "label-engine"]
+        other_candidates = [(s, k, sc) for s, k, sc in candidates if k != "label-engine"]
+
+        results: list[tuple[str, dict]] = []
+        if le_candidates and not other_candidates:
+            # Pure label-engine file — pick the highest-scoring sheet only.
+            le_candidates.sort(key=lambda t: -t[2])
+            s, k, _ = le_candidates[0]
+            results = [(s, {**FORMAT_SCHEMAS[k], "_key": k})]
+        else:
+            # Internal Deals / EpicWin — include all identified sheets.
+            for s, k, _ in other_candidates:
+                results.append((s, {**FORMAT_SCHEMAS[k], "_key": k}))
+            # Also include the best label-engine sheet if any survive alongside others
+            # (shouldn't happen for these file types, but be safe).
+            if le_candidates:
+                le_candidates.sort(key=lambda t: -t[2])
+                s, k, _ = le_candidates[0]
+                results.append((s, {**FORMAT_SCHEMAS[k], "_key": k}))
+
+        return results
     finally:
         wb.close()
 
@@ -944,6 +1351,7 @@ def find_missing_required(
     df: pd.DataFrame,
     tracks_sheet: str,
     prior_missing_actions: dict[tuple[int, str], str] | None = None,
+    required_fields_override: list | None = None,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """
     For each required field that exists in the sheet, flag every row whose value
@@ -959,9 +1367,11 @@ def find_missing_required(
     """
     prior_missing_actions = prior_missing_actions or {}
 
+    fields_to_check = required_fields_override if required_fields_override is not None else REQUIRED_FIELDS
+
     # Resolve each requirement to either an actual column name (if present) or None.
     resolved: list[tuple[object, str | None]] = []
-    for req in REQUIRED_FIELDS:
+    for req in fields_to_check:
         resolved.append((req, required_field_present(req, df.columns)))
 
     present_cols = [c for _, c in resolved if c]
@@ -1478,6 +1888,9 @@ def write_report(
     format_corrections: list[dict],
     splits_review: list[dict],
     source_path: Path,
+    split_errors: list[dict] | None = None,
+    id_mismatches: list[dict] | None = None,
+    detected_format: str = "",
 ) -> None:
     wb = Workbook()
 
@@ -1752,16 +2165,51 @@ def write_report(
 
     autosize(ws_msr, max_width=80)
 
+    # Split Errors tab (EpicWin splits format only) --------------------------
+    if split_errors:
+        ws_spl = wb.create_sheet("Split Errors")
+        spl_headers = ["ISRC", "Track Title", "Rows", "Split Total", "Difference from 100"]
+        ws_spl.append(spl_headers)
+        for cell in ws_spl[1]:
+            cell.fill = HEADER_FILL
+            cell.font = HEADER_FONT
+        ws_spl.freeze_panes = "A2"
+        for i, row in enumerate(split_errors, start=2):
+            ws_spl.append([row.get(h, "") for h in spl_headers])
+            if i % 2 == 0:
+                for cell in ws_spl[i]:
+                    cell.fill = ALT_FILL
+        autosize(ws_spl)
+
+    # ID Mismatches tab (EpicWin splits format only) -------------------------
+    if id_mismatches:
+        ws_idm = wb.create_sheet("ID Mismatches")
+        idm_headers = ["Type", "ID", "Names found", "Rows"]
+        ws_idm.append(idm_headers)
+        for cell in ws_idm[1]:
+            cell.fill = HEADER_FILL
+            cell.font = HEADER_FONT
+        ws_idm.freeze_panes = "A2"
+        for i, row in enumerate(id_mismatches, start=2):
+            ws_idm.append([row.get(h, "") for h in idm_headers])
+            if i % 2 == 0:
+                for cell in ws_idm[i]:
+                    cell.fill = ALT_FILL
+        autosize(ws_idm)
+
     # About sheet -----------------------------------------------------------
     ws_about = wb.create_sheet("About", 0)
     n_artist = sum(1 for i in issues if i.get("Type") == TYPE_ARTIST)
     n_isrc = sum(1 for i in issues if i.get("Type") == TYPE_ISRC)
     n_missing = sum(1 for i in issues if i.get("Type") == TYPE_MISSING)
     n_format = sum(1 for i in issues if i.get("Type") == TYPE_FORMAT)
+    n_splits = len(split_errors) if split_errors else 0
+    n_id_mismatches = len(id_mismatches) if id_mismatches else 0
     info = [
         ["Metadata Sheet Scanner — Issues Report"],
         [],
         ["Source file", str(source_path)],
+        ["Detected format", detected_format or "label-engine"],
         ["Checks run", "Artist-name typos · Duplicate ISRCs · Missing required fields · Format validation"],
         ["Artist similarity threshold", f"{SIMILARITY_THRESHOLD}%"],
         ["Min artist name length", str(MIN_NAME_LENGTH)],
@@ -1770,6 +2218,8 @@ def write_report(
         ["Duplicate-ISRC issues found", n_isrc],
         ["Missing-field issues found", n_missing],
         ["Format issues found", n_format],
+        ["Split errors found (EpicWin)", n_splits],
+        ["ID mismatches found (EpicWin)", n_id_mismatches],
         ["Artist clusters identified", len(cluster_summary)],
         ["ISRC conflicts identified", len({r["Conflict"] for r in isrc_summary})],
         ["Column-wide format issues", len(format_column_summary)],
@@ -1834,7 +2284,7 @@ def analyze(
     input_path: Path,
     issues_output_path: Path | None = None,
     project_dir: Path | None = None,
-) -> tuple[list[dict], list[dict], list[dict], list[dict], list[dict], list[dict], list[dict], list[dict], list[dict], dict]:
+) -> tuple[list[dict], list[dict], list[dict], list[dict], list[dict], list[dict], list[dict], list[dict], list[dict], dict, list[dict], list[dict]]:
     """
     Run all checks on a sheet and return
     (issues, cluster_summary, isrc_summary, missing_summary, missing_per_cell,
@@ -1847,34 +2297,93 @@ def analyze(
     cluster_summary so a re-scan in the middle of correction work doesn't
     blow away the user's progress.
     """
-    tracks_sheet, sheet_candidates = detect_tracks_sheet(input_path)
-    df = pd.read_excel(input_path, sheet_name=tracks_sheet, header=0)
+    project_root = Path(project_dir) if project_dir else Path(__file__).resolve().parent
+    leave_records = load_leave_records(project_root)
+    isrc_leave_records = load_isrc_leave_records(project_root)
+    prior_corrections = load_prior_corrections(issues_output_path) if issues_output_path else []
+    prior_isrc_actions = load_prior_isrc_actions(issues_output_path) if issues_output_path else {}
+    prior_missing_actions = load_prior_missing_actions(issues_output_path) if issues_output_path else {}
+    prior_format_corrections = load_prior_format_corrections(issues_output_path) if issues_output_path else {}
+    prior_splits_review = load_prior_splits_review(issues_output_path) if issues_output_path else {}
 
-    # ---- Artist-name typo check --------------------------------------------
-    occurrences = collect_occurrences(df)
-    unique_names = sorted({o.name for o in occurrences})
+    # Discover all sheets to scan and their schemas.
+    sheets_to_scan = detect_all_sheets_to_scan(input_path)
 
+    # Accumulate results across all sheets.
+    all_occurrences: list = []
+    all_isrc_issues: list[dict] = []
+    all_isrc_summary: list[dict] = []
+    all_missing_issues: list[dict] = []
+    all_missing_summary: list[dict] = []
+    all_missing_per_cell: list[dict] = []
+    all_format_issues: list[dict] = []
+    all_format_column_summary: list[dict] = []
+    all_format_row_summary: list[dict] = []
+    all_format_corrections: list[dict] = []
+    all_splits_review: list[dict] = []
+    all_split_errors: list[dict] = []
+    all_id_mismatches: list[dict] = []
+    detected_format_names: list[str] = []
+    primary_sheet = sheets_to_scan[0][0] if sheets_to_scan else ""
+
+    for sheet_name, schema in sheets_to_scan:
+        schema_key = schema.get("_key", "label-engine")
+        checks = schema.get("checks", set())
+        required_override = schema.get("required_fields_override")
+        detected_format_names.append(schema["display_name"])
+
+        df_raw = pd.read_excel(input_path, sheet_name=sheet_name, header=0)
+        df = normalize_columns(df_raw, schema)
+
+        if "artist_typos" in checks:
+            all_occurrences.extend(collect_occurrences(df))
+
+        if "isrc_duplicates" in checks:
+            isrc_iss, isrc_sum = find_isrc_conflicts(
+                df, sheet_name,
+                isrc_leave_records=isrc_leave_records,
+                prior_isrc_actions=prior_isrc_actions,
+            )
+            all_isrc_issues.extend(isrc_iss)
+            all_isrc_summary.extend(isrc_sum)
+
+        if "missing_fields" in checks:
+            miss_iss, miss_sum, miss_cell = find_missing_required(
+                df, sheet_name,
+                prior_missing_actions=prior_missing_actions,
+                required_fields_override=required_override,
+            )
+            all_missing_issues.extend(miss_iss)
+            all_missing_summary.extend(miss_sum)
+            all_missing_per_cell.extend(miss_cell)
+
+        if "format_validation" in checks:
+            (fmt_iss, fmt_col, fmt_row, fmt_corr, spl_rev) = find_format_issues(
+                input_path, df, sheet_name,
+                prior_format_corrections=prior_format_corrections,
+                prior_splits_review=prior_splits_review,
+            )
+            all_format_issues.extend(fmt_iss)
+            all_format_column_summary.extend(fmt_col)
+            all_format_row_summary.extend(fmt_row)
+            all_format_corrections.extend(fmt_corr)
+            all_splits_review.extend(spl_rev)
+
+        if "splits_correction" in checks:
+            spl_iss, spl_err, id_mis = find_splits_correction_issues(df, sheet_name)
+            all_format_issues.extend(spl_iss)   # surface in Issues tab
+            all_split_errors.extend(spl_err)
+            all_id_mismatches.extend(id_mis)
+
+    # ---- Artist-name clustering (across all sheets combined) ----------------
+    unique_names = sorted({o.name for o in all_occurrences})
     counts: dict[str, int] = defaultdict(int)
-    for o in occurrences:
+    for o in all_occurrences:
         counts[o.name] += 1
 
     clusters = build_clusters(unique_names)
-
-    # Drop clusters the user previously marked as intentional (LEAVE markers
-    # persisted in .artist_leave.json at the project root, so a single
-    # decision applies across phases). They're real artists who happen to
-    # have similar names — we shouldn't keep flagging them every scan.
-    # `project_dir` lets a caller (e.g., the web backend) point the LEAVE-record
-    # lookup at a directory it controls instead of the module's own folder.
-    project_root = Path(project_dir) if project_dir else Path(__file__).resolve().parent
-    leave_records = load_leave_records(project_root)
     if leave_records:
         clusters = [c for c in clusters if not _matches_leave(c, leave_records)]
-
-    # If a previous _issues.xlsx exists, lift any Correction values the user
-    # already typed so a re-scan in the middle of correction work doesn't
-    # blow away their progress.
-    prior_corrections = load_prior_corrections(issues_output_path) if issues_output_path else []
 
     name_to_canonical: dict[str, tuple[str, int]] = {}
     cluster_summary: list[dict] = []
@@ -1886,10 +2395,6 @@ def analyze(
             f"{n} ({counts[n]})" for n in sorted(cluster, key=lambda x: -counts[x])
         )
         carried = _find_prior_correction(cluster, prior_corrections)
-        # If we recognize this cluster from a previous scan, carry the user's
-        # value verbatim — including empty (they explicitly cleared it to
-        # skip). For brand-new clusters with no prior overlap, pre-fill with
-        # the canonical guess so the most common case is a one-glance confirm.
         correction_value = canonical if carried is None else carried
         cluster_summary.append({
             "Cluster": f"T{cid}",
@@ -1900,7 +2405,7 @@ def analyze(
         })
 
     artist_issues: list[dict] = []
-    for o in occurrences:
+    for o in all_occurrences:
         if o.name not in name_to_canonical:
             continue
         canonical, cid = name_to_canonical[o.name]
@@ -1916,7 +2421,7 @@ def analyze(
             notes.append("ALL CAPS")
         artist_issues.append({
             "Type": TYPE_ARTIST,
-            "Sheet": tracks_sheet,
+            "Sheet": o.column,   # preserve sheet-column origin
             "Excel Row": o.row,
             "Column": o.column,
             "Found Value": o.name,
@@ -1927,82 +2432,49 @@ def analyze(
         })
     artist_issues.sort(key=lambda r: (r["Cluster"], r["Excel Row"]))
 
-    # ---- Duplicate-ISRC check ----------------------------------------------
-    # Conflicts the user has previously confirmed as intentional duplicates
-    # are skipped on every scan from here on (mirrors the artist LEAVE system).
-    isrc_leave_records = load_isrc_leave_records(project_root)
-    # Carry forward the user's in-progress Confirm OK? / Corrected ISRC entries
-    # from the previous issues file so re-scanning mid-review doesn't wipe them.
-    prior_isrc_actions = load_prior_isrc_actions(issues_output_path) if issues_output_path else {}
-    isrc_issues, isrc_summary = find_isrc_conflicts(
-        df, tracks_sheet,
-        isrc_leave_records=isrc_leave_records,
-        prior_isrc_actions=prior_isrc_actions,
-    )
-
-    # ---- Missing-required-fields check -------------------------------------
-    # Carry the user's in-progress Fill Values forward across re-scans the
-    # same way artist Corrections and ISRC Confirm OK? entries are carried.
-    prior_missing_actions = (
-        load_prior_missing_actions(issues_output_path) if issues_output_path else {}
-    )
-    missing_issues, missing_summary, missing_per_cell = find_missing_required(
-        df, tracks_sheet, prior_missing_actions=prior_missing_actions
-    )
-
-    # ---- Format-validation check -------------------------------------------
-    # Carry-forward in-progress entries from prior format-fix tabs.
-    prior_format_corrections = (
-        load_prior_format_corrections(issues_output_path) if issues_output_path else {}
-    )
-    prior_splits_review = (
-        load_prior_splits_review(issues_output_path) if issues_output_path else {}
-    )
-    (
-        format_issues,
-        format_column_summary,
-        format_row_summary,
-        format_corrections,
-        splits_review,
-    ) = find_format_issues(
-        input_path, df, tracks_sheet,
-        prior_format_corrections=prior_format_corrections,
-        prior_splits_review=prior_splits_review,
-    )
-
     # ---- Combine -----------------------------------------------------------
-    issues = artist_issues + isrc_issues + missing_issues + format_issues
+    issues = artist_issues + all_isrc_issues + all_missing_issues + all_format_issues
 
-    other_sheets_with_isrc = [c for c in sheet_candidates if c[0] != tracks_sheet]
+    # Build format display string (deduplicated, preserving order).
+    seen_fmt: set[str] = set()
+    fmt_display_parts: list[str] = []
+    for name in detected_format_names:
+        if name not in seen_fmt:
+            fmt_display_parts.append(name)
+            seen_fmt.add(name)
+    detected_format = " + ".join(fmt_display_parts) if fmt_display_parts else "label-engine"
+
     stats = {
-        "tracks_sheet": tracks_sheet,
-        "other_sheets_with_track_isrc": [
-            f"{name} (score {score}, {ncols} cols)"
-            for name, score, ncols in other_sheets_with_isrc
-        ],
-        "occurrences": len(occurrences),
+        "tracks_sheet": primary_sheet,
+        "detected_format": detected_format,
+        "sheets_scanned": [s for s, _ in sheets_to_scan],
+        "other_sheets_with_track_isrc": [],
+        "occurrences": len(all_occurrences),
         "unique_names": len(unique_names),
         "artist_clusters": len(clusters),
         "artist_typo_cells": len(artist_issues),
-        # `isrc_summary` is now per-offending-row; count distinct Conflict IDs.
-        "isrc_conflicts": len({r["Conflict"] for r in isrc_summary}),
-        "isrc_conflict_cells": len(isrc_issues),
-        "missing_field_issues": len(missing_issues),
-        "format_issues": len(format_issues),
-        "format_columns_wide": len(format_column_summary),
+        "isrc_conflicts": len({r["Conflict"] for r in all_isrc_summary}),
+        "isrc_conflict_cells": len(all_isrc_issues),
+        "missing_field_issues": len(all_missing_issues),
+        "format_issues": len(all_format_issues),
+        "format_columns_wide": len(all_format_column_summary),
+        "splits_errors": len(all_split_errors),
+        "id_mismatches": len(all_id_mismatches),
         "total_issues": len(issues),
     }
     return (
         issues,
         cluster_summary,
-        isrc_summary,
-        missing_summary,
-        missing_per_cell,
-        format_column_summary,
-        format_row_summary,
-        format_corrections,
-        splits_review,
+        all_isrc_summary,
+        all_missing_summary,
+        all_missing_per_cell,
+        all_format_column_summary,
+        all_format_row_summary,
+        all_format_corrections,
+        all_splits_review,
         stats,
+        all_split_errors,
+        all_id_mismatches,
     )
 
 
@@ -2813,6 +3285,8 @@ def main() -> int:
         format_corrections,
         splits_review,
         stats,
+        split_errors,
+        id_mismatches,
     ) = analyze(in_path, issues_output_path=prior_issues_path)
 
     outputs_written: list[Path] = []
@@ -2834,6 +3308,9 @@ def main() -> int:
             format_corrections,
             splits_review,
             in_path,
+            split_errors=split_errors,
+            id_mismatches=id_mismatches,
+            detected_format=stats.get("detected_format", ""),
         )
         outputs_written.append(report_path)
 

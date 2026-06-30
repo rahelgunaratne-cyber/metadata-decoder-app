@@ -6,6 +6,8 @@ export interface Counts {
   isrcConflictGroups: number;
   missingFields: number;
   formatIssues: number;
+  splitErrors: number;
+  idMismatches: number;
   total: number;
 }
 
@@ -16,6 +18,8 @@ export interface Scan {
   updated_at: string;
   uploaded_by: string;
   tracks_sheet: string;
+  sheets_scanned: string[];
+  detected_format: string;
   other_sheets: string[];
   is_rescan: boolean;
   status: string;
@@ -34,6 +38,9 @@ export interface Results {
   formatRows: Row[];
   formatCorrections: Row[];
   splitsReview: Row[];
+  splitErrors: Row[];
+  idMismatches: Row[];
+  detectedFormat: string;
 }
 
 export interface ScanDetail {

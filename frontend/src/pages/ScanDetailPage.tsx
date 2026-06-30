@@ -81,6 +81,19 @@ export function ScanDetailPage() {
             Tab: <span className="font-medium">{scan.tracks_sheet}</span>
             {scan.is_rescan ? " · re-scanned" : ""}
           </p>
+          {scan.detected_format && (
+            <p className="mt-1 text-xs text-muted">
+              Format detected:{" "}
+              <span className="inline-flex items-center rounded-full bg-navy/10 px-2 py-0.5 text-xs font-medium text-navy">
+                {scan.detected_format}
+              </span>
+              {scan.sheets_scanned && scan.sheets_scanned.length > 1 && (
+                <span className="ml-2 text-muted">
+                  ({scan.sheets_scanned.length} sheets scanned)
+                </span>
+              )}
+            </p>
+          )}
           <div className="mt-2">
             <CountPills counts={scan.counts} />
           </div>

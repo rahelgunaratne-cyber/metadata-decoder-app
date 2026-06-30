@@ -112,6 +112,8 @@ class EngineService:
             format_corrections,
             splits_review,
             stats,
+            split_errors,
+            id_mismatches,
         ) = summaries
         return {
             "stats": stats,
@@ -124,6 +126,9 @@ class EngineService:
             "formatRows": format_row_summary,
             "formatCorrections": format_corrections,
             "splitsReview": splits_review,
+            "splitErrors": split_errors,
+            "idMismatches": id_mismatches,
+            "detectedFormat": stats.get("detected_format", "label-engine"),
         }
 
     @staticmethod
@@ -134,6 +139,8 @@ class EngineService:
             "isrcConflictGroups": stats.get("isrc_conflicts", 0),
             "missingFields": stats.get("missing_field_issues", 0),
             "formatIssues": stats.get("format_issues", 0),
+            "splitErrors": stats.get("splits_errors", 0),
+            "idMismatches": stats.get("id_mismatches", 0),
             "total": stats.get("total_issues", 0),
         }
 
@@ -144,7 +151,7 @@ class EngineService:
         three artifacts, and return the results payload."""
         (issues, cluster_summary, isrc_summary, missing_summary, missing_per_cell,
          format_column_summary, format_row_summary, format_corrections,
-         splits_review, stats) = summaries
+         splits_review, stats, split_errors, id_mismatches) = summaries
 
         issues_path = tmp / "issues.xlsx"
         annotated_path = tmp / "annotated.xlsx"
@@ -153,6 +160,9 @@ class EngineService:
             issues_path, issues, cluster_summary, isrc_summary, missing_summary,
             missing_per_cell, format_column_summary, format_row_summary,
             format_corrections, splits_review, work_path,
+            split_errors=split_errors,
+            id_mismatches=id_mismatches,
+            detected_format=stats.get("detected_format", ""),
         )
         sm.write_annotated_copy(work_path, annotated_path, issues, stats["tracks_sheet"])
 
@@ -191,6 +201,8 @@ class EngineService:
             "updated_at": _now(),
             "uploaded_by": user_email,
             "tracks_sheet": stats.get("tracks_sheet", ""),
+            "sheets_scanned": stats.get("sheets_scanned", []),
+            "detected_format": stats.get("detected_format", "label-engine"),
             "other_sheets": stats.get("other_sheets_with_track_isrc", []),
             "is_rescan": False,
             "status": "done",
@@ -257,6 +269,8 @@ class EngineService:
             "is_rescan": True,
             "counts": self._counts(stats),
             "tracks_sheet": stats.get("tracks_sheet", ""),
+            "detected_format": stats.get("detected_format", "label-engine"),
+            "sheets_scanned": stats.get("sheets_scanned", []),
         }
         self.db.update_scan(scan_id, fields)
         scan = self.db.get_scan(scan_id)
