@@ -593,6 +593,15 @@ def detect_all_sheets_to_scan(input_path: Path) -> list[tuple[str, dict]]:
             first = wb.sheetnames[0]
             return [(first, {"_key": "unknown", "display_name": "unknown", "checks": set()})]
 
+        # Detect whether a dedicated splits tab exists alongside the main metadata
+        # sheet. When it does, the Artist 1 fields are no longer in the metadata
+        # tab, so we drop them from the required-fields check to avoid false positives.
+        all_sheet_names_lower = [n.lower() for n in wb.sheetnames]
+        has_splits_tab = any(
+            "splits" in n and "correction" not in n
+            for n in all_sheet_names_lower
+        )
+
         # For label-engine: keep only the single best sheet.
         le_candidates = [(s, k, sc) for s, k, sc in candidates if k == "label-engine"]
         other_candidates = [(s, k, sc) for s, k, sc in candidates if k != "label-engine"]
@@ -602,7 +611,15 @@ def detect_all_sheets_to_scan(input_path: Path) -> list[tuple[str, dict]]:
             # Pure label-engine file — pick the highest-scoring sheet only.
             le_candidates.sort(key=lambda t: -t[2])
             s, k, _ = le_candidates[0]
-            results = [(s, {**FORMAT_SCHEMAS[k], "_key": k})]
+            schema = {**FORMAT_SCHEMAS[k], "_key": k}
+            if has_splits_tab:
+                # Strip Artist 1 required fields — they live in the splits tab.
+                schema["required_fields_override"] = [
+                    f for f in REQUIRED_FIELDS
+                    if not (isinstance(f, str) and f.startswith("Artist 1"))
+                    and not (isinstance(f, tuple) and any(c.startswith("Artist 1") for c in f))
+                ]
+            results = [(s, schema)]
         else:
             # Internal Deals / EpicWin — include all identified sheets.
             for s, k, _ in other_candidates:
