@@ -610,8 +610,8 @@ def detect_all_sheets_to_scan(input_path: Path) -> list[tuple[str, dict]]:
         if le_candidates and not other_candidates:
             # Pure label-engine file — pick the highest-scoring sheet only.
             le_candidates.sort(key=lambda t: -t[2])
-            s, k, _ = le_candidates[0]
-            schema = {**FORMAT_SCHEMAS[k], "_key": k}
+            s, k, score = le_candidates[0]
+            schema = {**FORMAT_SCHEMAS[k], "_key": k, "_detection_score": score}
             if has_splits_tab:
                 # Strip Artist 1 required fields — they live in the splits tab.
                 schema["required_fields_override"] = [
@@ -619,6 +619,21 @@ def detect_all_sheets_to_scan(input_path: Path) -> list[tuple[str, dict]]:
                     if not (isinstance(f, str) and f.startswith("Artist 1"))
                     and not (isinstance(f, tuple) and any(c.startswith("Artist 1") for c in f))
                 ]
+                # Record which tab holds the splits so analyze() can validate it.
+                # Prefer tabs without "old" in the name; fall back to any splits tab.
+                splits_tab_name = next(
+                    (n for n in wb.sheetnames
+                     if "splits" in n.lower()
+                     and "correction" not in n.lower()
+                     and "old" not in n.lower()),
+                    None,
+                ) or next(
+                    (n for n in wb.sheetnames
+                     if "splits" in n.lower() and "correction" not in n.lower()),
+                    None,
+                )
+                if splits_tab_name:
+                    schema["_splits_tab"] = splits_tab_name
             results = [(s, schema)]
         else:
             # Internal Deals / EpicWin — include all identified sheets.
@@ -1596,6 +1611,118 @@ class _CellInfo:
         return f"_CellInfo({self.value!r}, {self.number_format!r})"
 
 
+def find_splits_tab_issues(
+    input_path: Path,
+    splits_sheet: str,
+    metadata_isrcs: set[str],
+) -> tuple[list[dict], list[dict]]:
+    """
+    Validate a dedicated Splits tab (e.g. 'Splits - Masters') that accompanies
+    a Label Engine metadata sheet.
+
+    Returns:
+        split_errors  — ISRCs whose Client Master Split LE values don't sum to 100
+        orphan_issues — ISRCs present in the splits tab but absent from the metadata tab
+    """
+    try:
+        df = pd.read_excel(input_path, sheet_name=splits_sheet, header=0)
+    except Exception:
+        return [], []
+
+    # Normalise column names: strip whitespace, lower for lookup.
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Find the split percentage column — tolerate slight name variations.
+    split_col = None
+    for candidate in ("Client Master Split LE", "Client Master Split", "Master Split"):
+        if candidate in df.columns:
+            split_col = candidate
+            break
+
+    isrc_col = next((c for c in df.columns if "isrc" in c.lower()), None)
+    title_col = next((c for c in df.columns if "title" in c.lower()), None)
+
+    split_errors: list[dict] = []
+    orphan_issues: list[dict] = []
+
+    if isrc_col:
+        # --- Orphan ISRCs: in splits tab but not in metadata tab ---
+        seen_orphans: set[str] = set()
+        for idx, row in df.iterrows():
+            raw = row.get(isrc_col)
+            if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+                continue
+            isrc_val = str(raw).strip().upper()
+            if not isrc_val:
+                continue
+            # Skip values that don't look like ISRCs (e.g. stray header rows).
+            if not ISRC_PATTERN.match(isrc_val.replace("-", "").replace(" ", "")):
+                continue
+            if isrc_val not in metadata_isrcs and isrc_val not in seen_orphans:
+                seen_orphans.add(isrc_val)
+                title = str(row.get(title_col, "")).strip() if title_col else ""
+                orphan_issues.append({
+                    "Type": "Format issue",
+                    "Sheet": splits_sheet,
+                    "Excel Row": int(idx) + 2,
+                    "Column": isrc_col,
+                    "Found Value": isrc_val,
+                    "Suggested Value": "—",
+                    "Similarity": "",
+                    "Cluster": "F-ORPHAN-ISRC",
+                    "Notes": (
+                        f"ISRC '{isrc_val}' appears in the Splits tab"
+                        + (f" ('{title}')" if title else "")
+                        + " but has no matching row in the Metadata tab. "
+                        "Check for typos or a missing metadata entry."
+                    ),
+                })
+
+        # --- Splits sum to 100 per ISRC ---
+        if split_col:
+            from collections import defaultdict
+            totals: dict[str, float] = defaultdict(float)
+            titles: dict[str, str] = {}
+            for _, row in df.iterrows():
+                raw_isrc = row.get(isrc_col)
+                if raw_isrc is None or (isinstance(raw_isrc, float) and pd.isna(raw_isrc)):
+                    continue
+                isrc_val = str(raw_isrc).strip().upper()
+                if not isrc_val:
+                    continue
+                if not ISRC_PATTERN.match(isrc_val.replace("-", "").replace(" ", "")):
+                    continue
+                raw_pct = row.get(split_col)
+                if raw_pct is None or (isinstance(raw_pct, float) and pd.isna(raw_pct)):
+                    continue
+                try:
+                    pct = float(raw_pct)
+                    # Values stored as decimals (0.25) → convert to percent.
+                    if 0 < pct <= 1.0:
+                        pct *= 100
+                    totals[isrc_val] += pct
+                except (TypeError, ValueError):
+                    pass
+                if title_col and isrc_val not in titles:
+                    t = row.get(title_col)
+                    if t and not (isinstance(t, float) and pd.isna(t)):
+                        titles[isrc_val] = str(t).strip()
+
+            for isrc_val, total in totals.items():
+                if abs(total - 100.0) > 0.5:
+                    split_errors.append({
+                        "Release ID": "",
+                        "ISRC": isrc_val,
+                        "Track Title": titles.get(isrc_val, ""),
+                        "Rows": "—",
+                        "Split Total": round(total, 2),
+                        "Difference from 100": round(total - 100.0, 2),
+                        "_sheet": splits_sheet,
+                    })
+
+    return split_errors, orphan_issues
+
+
 def find_format_issues(
     input_path: Path,
     df: pd.DataFrame,
@@ -1909,6 +2036,60 @@ def find_format_issues(
                 "Excel Row": "—",
                 "Total %": "—",
                 "Difference": f"{bad} cells",
+            })
+
+    # ---- Release date validation -------------------------------------------
+    import datetime as _dt
+    release_date_col = "Release Date"
+    if release_date_col in df.columns:
+        bad_dates = 0
+        min_year, max_year = 1900, _dt.date.today().year + 5
+        for idx, val in df[release_date_col].items():
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                continue
+            parsed = None
+            if isinstance(val, (_dt.datetime, _dt.date)):
+                parsed = val if isinstance(val, _dt.date) else val.date()
+            else:
+                for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
+                    try:
+                        parsed = _dt.datetime.strptime(str(val).strip(), fmt).date()
+                        break
+                    except ValueError:
+                        pass
+            excel_row = int(idx) + 2
+            if parsed is None:
+                bad_dates += 1
+                issues.append({
+                    "Type": TYPE_FORMAT,
+                    "Sheet": tracks_sheet,
+                    "Excel Row": excel_row,
+                    "Column": release_date_col,
+                    "Found Value": str(val),
+                    "Suggested Value": "YYYY-MM-DD",
+                    "Similarity": "",
+                    "Cluster": "F-DATE",
+                    "Notes": "Release date could not be parsed. Use YYYY-MM-DD format.",
+                })
+            elif not (min_year <= parsed.year <= max_year):
+                bad_dates += 1
+                issues.append({
+                    "Type": TYPE_FORMAT,
+                    "Sheet": tracks_sheet,
+                    "Excel Row": excel_row,
+                    "Column": release_date_col,
+                    "Found Value": str(parsed),
+                    "Suggested Value": f"A date between {min_year} and {max_year}",
+                    "Similarity": "",
+                    "Cluster": "F-DATE",
+                    "Notes": f"Release date year {parsed.year} is outside the expected range ({min_year}–{max_year}).",
+                })
+        if bad_dates:
+            per_row_summary.append({
+                "Issue": "Malformed or out-of-range release dates",
+                "Excel Row": "—",
+                "Total %": "—",
+                "Difference": f"{bad_dates} cells",
             })
 
     issues.sort(key=lambda r: (r["Cluster"], r["Excel Row"]))
@@ -2451,6 +2632,32 @@ def analyze(
             all_split_errors.extend(spl_err)
             all_id_mismatches.extend(id_mis)
 
+        # After scanning the main label-engine sheet, also validate its
+        # companion Splits tab (if one was detected).
+        if schema_key == "label-engine":
+            splits_tab = schema.get("_splits_tab")
+            if splits_tab:
+                # Collect ISRCs from this metadata sheet for the orphan check.
+                isrc_col_name = "Track ISRC"
+                metadata_isrcs: set[str] = set()
+                if isrc_col_name in df.columns:
+                    for v in df[isrc_col_name].dropna():
+                        metadata_isrcs.add(str(v).strip().upper())
+                spl_errs, orphan_iss = find_splits_tab_issues(
+                    input_path, splits_tab, metadata_isrcs
+                )
+                all_split_errors.extend(spl_errs)
+                all_format_issues.extend(orphan_iss)
+
+    # ---- Detection confidence -----------------------------------------------
+    # Flag when the best-matching sheet scored in the low-confidence band so
+    # the UI can surface a warning without blocking the scan.
+    best_score = max(
+        (s.get("_detection_score", 1.0) for _, s in sheets_to_scan),
+        default=1.0,
+    )
+    low_confidence = best_score < 0.75
+
     # ---- Artist-name clustering (across all sheets combined) ----------------
     unique_names = sorted({o.name for o in all_occurrences})
     counts: dict[str, int] = defaultdict(int)
@@ -2527,6 +2734,7 @@ def analyze(
         "tracks_sheet": primary_sheet,
         "detected_format": detected_format,
         "sheets_scanned": [s for s, _ in sheets_to_scan],
+        "detection_low_confidence": low_confidence,
         "other_sheets_with_track_isrc": [],
         "occurrences": len(all_occurrences),
         "unique_names": len(unique_names),

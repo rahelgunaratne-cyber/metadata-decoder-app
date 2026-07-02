@@ -21,6 +21,7 @@ export interface Scan {
   tracks_sheet: string;
   sheets_scanned: string[];
   detected_format: string;
+  detection_low_confidence: boolean;
   other_sheets: string[];
   is_rescan: boolean;
   status: string;

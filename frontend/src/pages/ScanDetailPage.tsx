@@ -96,6 +96,11 @@ export function ScanDetailPage() {
               )}
             </p>
           )}
+          {scan.detection_low_confidence && (
+            <p className="mt-1 text-xs text-amber-700 bg-amber-50 rounded px-2 py-1 inline-block">
+              Low-confidence format match — some columns may not have been recognized. Review results carefully.
+            </p>
+          )}
           <div className="mt-2">
             <CountPills counts={scan.counts} />
           </div>

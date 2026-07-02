@@ -204,6 +204,7 @@ class EngineService:
             "tracks_sheet": stats.get("tracks_sheet", ""),
             "sheets_scanned": stats.get("sheets_scanned", []),
             "detected_format": stats.get("detected_format", "label-engine"),
+            "detection_low_confidence": stats.get("detection_low_confidence", False),
             "other_sheets": stats.get("other_sheets_with_track_isrc", []),
             "is_rescan": False,
             "status": "done",
@@ -271,6 +272,7 @@ class EngineService:
             "counts": self._counts(stats),
             "tracks_sheet": stats.get("tracks_sheet", ""),
             "detected_format": stats.get("detected_format", "label-engine"),
+            "detection_low_confidence": stats.get("detection_low_confidence", False),
             "sheets_scanned": stats.get("sheets_scanned", []),
         }
         self.db.update_scan(scan_id, fields)
