@@ -110,7 +110,21 @@ export function ScanDetailPage() {
         </div>
       </div>
 
-      {scan.counts.total === 0 ? (
+      {scan.detected_format === "unknown" ? (
+        <Card className="p-8">
+          <p className="text-base font-semibold text-ink">Format not recognized</p>
+          <p className="mt-2 text-sm text-muted">
+            This file doesn't match any of the supported templates: Label Engine Master,
+            Internal Deals, or Split Correction. No checks were run.
+          </p>
+          <p className="mt-3 text-sm text-muted">
+            Sheets found:{" "}
+            <span className="font-medium text-ink">
+              {scan.sheets_scanned?.join(", ") ?? scan.tracks_sheet}
+            </span>
+          </p>
+        </Card>
+      ) : scan.counts.total === 0 ? (
         <Card className="p-10 text-center">
           <div className="text-3xl">✓</div>
           <p className="mt-2 text-base font-semibold text-clean-ink">

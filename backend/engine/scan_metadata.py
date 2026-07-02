@@ -252,6 +252,7 @@ FORMAT_FINGERPRINTS: dict[str, list[str]] = {
     ],
     "epicwin-splits": [
         "ISRC", "UPC", "Release Artist", "Track Artist", "Track Title",
+        "Allocation Percentage", "Net / Gross",
     ],
 }
 FORMAT_MATCH_THRESHOLD = 0.6   # fraction of fingerprint columns that must be present
@@ -590,7 +591,7 @@ def detect_all_sheets_to_scan(input_path: Path) -> list[tuple[str, dict]]:
 
         if not candidates:
             first = wb.sheetnames[0]
-            return [(first, {**FORMAT_SCHEMAS["label-engine"], "_key": "label-engine"})]
+            return [(first, {"_key": "unknown", "display_name": "unknown", "checks": set()})]
 
         # For label-engine: keep only the single best sheet.
         le_candidates = [(s, k, sc) for s, k, sc in candidates if k == "label-engine"]
@@ -2348,6 +2349,22 @@ def analyze(
 
     # Discover all sheets to scan and their schemas.
     sheets_to_scan = detect_all_sheets_to_scan(input_path)
+
+    # If no schema matched, return immediately with zero issues and an "unknown"
+    # format marker so the UI can surface a friendly message.
+    if sheets_to_scan and sheets_to_scan[0][1].get("_key") == "unknown":
+        first_sheet = sheets_to_scan[0][0]
+        empty_stats = {
+            "tracks_sheet": first_sheet,
+            "detected_format": "unknown",
+            "sheets_scanned": [first_sheet],
+            "other_sheets_with_track_isrc": [],
+            "occurrences": 0, "unique_names": 0, "artist_clusters": 0,
+            "artist_typo_cells": 0, "isrc_conflicts": 0, "isrc_conflict_cells": 0,
+            "missing_field_issues": 0, "format_issues": 0, "format_columns_wide": 0,
+            "splits_errors": 0, "id_mismatches": 0, "splits_issues": 0, "total_issues": 0,
+        }
+        return ([], [], [], [], [], [], [], [], [], empty_stats, [], [])
 
     # Accumulate results across all sheets.
     all_occurrences: list = []

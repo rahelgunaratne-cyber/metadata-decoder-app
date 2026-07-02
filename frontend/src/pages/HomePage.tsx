@@ -106,9 +106,14 @@ function ScanRow({ scan, onDelete }: { scan: Scan; onDelete: (id: string) => voi
           {scan.tracks_sheet}
           {scan.is_rescan ? " · re-scanned" : ""} · {timeAgo(scan.updated_at)}
         </div>
-        {scan.detected_format && (
+        {scan.detected_format && scan.detected_format !== "unknown" && (
           <span className="mt-0.5 inline-flex items-center rounded-full bg-navy/10 px-2 py-0.5 text-[10px] font-medium text-navy">
             {scan.detected_format}
+          </span>
+        )}
+        {scan.detected_format === "unknown" && (
+          <span className="mt-0.5 inline-flex items-center rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+            Unrecognized format
           </span>
         )}
       </td>
